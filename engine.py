@@ -275,6 +275,26 @@ def _rar(k): return RARITY[k]["label"] + " " + RARITY[k]["tag"]
 def _sloc(): return LOCATIONS[S["location_id"]]["name"] + " · " + SEASONS[S["season_id"]]["name"]
 def _footer(): return "点数 %d ｜ %s ｜ 回合 %d ｜ 图鉴 %d/%d" % (S["points"], _sloc(), S["turn"], len(S["encyclopedia"]), len(FISH))
 
+# 紧凑状态栏：每次 cmd() 末尾附一行机读 JSON，省得 AI 再 call status（也省 token）。关键信息为主，不堆杂项。
+def _state_json():
+    bait = {b: n for b, n in S["bait_inventory"].items() if n > 0}
+    j = {"pts": S["points"], "loc": LOCATIONS[S["location_id"]]["name"], "sea": SEASONS[S["season_id"]]["name"],
+         "turn": S["turn"], "enc": "%d/%d" % (len(S["encyclopedia"]), len(FISH)),
+         "bait": bait, "hold": len(S["catch_inventory"])}   # hold=未卖渔获条数
+    if S.get("pending_chests"): j["chest"] = len(S["pending_chests"])
+    return "📊 " + json.dumps(j, ensure_ascii=False)
+# 某地点当季还有几种没见过的鱼：normal=常规(常见~史诗)、legend=传说/神话(单列、可遇不可求)。
+# 传说/神话只算这地"专属"的（排除 locations:["all"] 的全域神话，免得每个钓点都被顶高、也免凑不满常规墙）。
+def _undiscovered_here(loc_id, sea_id):
+    normal = legend = 0
+    for f in FISH.values():
+        if not _eligible(f, loc_id, sea_id) or f["id"] in S["encyclopedia"]: continue
+        if f["rarity"] in ("legendary", "mythic"):
+            if "all" not in f["locations"]: legend += 1
+        else:
+            normal += 1
+    return normal, legend
+
 def _c_status():
     baits = "、".join("%s×%d" % (BAITS[b]["name"], n) for b, n in S["bait_inventory"].items() if n > 0) or "（没饵了，去 shop 买）"
     extra = ""
@@ -302,7 +322,10 @@ def _goto_list():
         cur = l["id"] == S["location_id"]; unlocked = l["id"] in S["unlocked_locations"]
         mark = "✦" if cur else ("·" if unlocked else "🔒")
         st = "【当前】" if cur else ("已解锁" if unlocked else "%d点解锁" % l["unlock_cost"])
-        sea = "本季有鱼" if S["season_id"] in l["available_seasons"] else "本季冷清"
+        season_ok = S["season_id"] in l["available_seasons"]
+        normal, legend = _undiscovered_here(l["id"], S["season_id"]) if season_ok else (0, 0)
+        leg = "（+%d 传说级）" % legend if legend > 0 else ""
+        sea = "本季冷清" if not season_ok else ("本季待发现 %d 种%s" % (normal, leg) if normal > 0 else ("本季常规已集齐%s" % leg if legend > 0 else "本季已集齐"))
         lines.append("  %s %s　%s　—— %s · %s" % (mark, l["name"], l["id"], st, sea))
     return "【钓点】（goto <地点id> 前往；🔒 的需花点数解锁）\n%s\n（你有 %d 点）" % ("\n".join(lines), S["points"])
 def _c_goto(loc_id):
@@ -313,9 +336,13 @@ def _c_goto(loc_id):
         if S["points"] < loc["unlock_cost"]: return "%s 还没解锁，需 %d 点，你只有 %d。" % (loc["name"], loc["unlock_cost"], S["points"])
         S["points"] -= loc["unlock_cost"]; S["unlocked_locations"].append(loc_id)
     S["location_id"] = loc_id; S["local_dry"] = 0
-    off = "（注意：本季节这里没什么鱼）" if S["season_id"] not in loc["available_seasons"] else ""
+    season_ok = S["season_id"] in loc["available_seasons"]
+    off = "（注意：本季节这里没什么鱼）" if not season_ok else ""
     char = ("\n" + loc["character"]) if loc.get("character") else ""
-    return "来到【%s】。%s%s%s\n%s" % (loc["name"], loc["description"], char, off, _footer())
+    normal, legend = _undiscovered_here(loc_id, S["season_id"]) if season_ok else (0, 0)
+    leg_hint = "，外加 %d 种传说级潜伏" % legend if legend > 0 else ""
+    hint = "" if not season_ok else ("\n本季这里还有 %d 种没见过的鱼%s。" % (normal, leg_hint) if normal > 0 else ("\n本季常规鱼已集齐，但还有 %d 种传说级潜伏。" % legend if legend > 0 else "\n本季这里的常规鱼你已集齐了。"))
+    return "来到【%s】。%s%s%s%s" % (loc["name"], loc["description"], char, off, hint)
 def _c_inv():
     out = []
     if S["catch_inventory"]:
@@ -446,11 +473,11 @@ def _cast_step(rng, bait_id):
     junk_chance = loc["junk_chance_base"] * bait["effects"].get("junk_chance_mult", 1.0)
     if rng.random() < junk_chance:
         S["local_dry"] = S.get("local_dry", 0) + 1
-        return {"text": season_msg + "🪣 %s。空军一竿。\n%s%s%s" % (_JUNK[rng.rint(0, len(_JUNK) - 1)], _footer(), _ambience(loc, rng), _secret_hint()), "consumed": True, "kind": "junk", "season_changed": season_changed}
+        return {"text": season_msg + "🪣 %s。空军一竿。%s%s" % (_JUNK[rng.rint(0, len(_JUNK) - 1)], _ambience(loc, rng), _secret_hint()), "consumed": True, "kind": "junk", "season_changed": season_changed}
     pool = [f for f in FISH.values() if _eligible(f, S["location_id"], S["season_id"])]
     if not pool:
         S["local_dry"] = S.get("local_dry", 0) + 1
-        return {"text": season_msg + "浮标纹丝不动……这片水域这个季节什么都没咬钩。\n%s%s%s" % (_footer(), _ambience(loc, rng), _secret_hint()), "consumed": True, "kind": "empty", "season_changed": season_changed}
+        return {"text": season_msg + "浮标纹丝不动……这片水域这个季节什么都没咬钩。%s%s" % (_ambience(loc, rng), _secret_hint()), "consumed": True, "kind": "empty", "season_changed": season_changed}
     weights = [_eff_weight(f, S["location_id"], S["season_id"], bait_id) for f in pool]
     f = _wpick(rng, pool, weights); size = _roll_size(rng, f); value = _value(f, size)
     inst = "c_%03d" % (S["stats"]["total_caught"] + 1)
@@ -471,9 +498,14 @@ def _c_cast(bait_id):
     return out
 
 _RARITY_RANK = {"common": 0, "uncommon": 1, "rare": 2, "epic": 3, "legendary": 4, "mythic": 5}
+_SOLO_HINT = "\n💡 一次只钓 1 竿挺费 token——下次试 cast 10 连钓，只回 1 条汇总（配 stop=new/rare 还能钓到新种/稀有就自动停）。"
 def _cast_many(bait_id, times, stop_on):
     times = max(1, min(20, int(times)))
-    if times == 1 and not stop_on: return _c_cast(bait_id)
+    if times == 1 and not stop_on:   # 单竿：钓成功就提醒可以连钓省 token
+        rng = _Rng(S["rngState"], S["rngCalls"])
+        r = _cast_step(rng, bait_id)
+        S["rngState"] = rng.state; S["rngCalls"] = rng.calls
+        return r["text"] + _SOLO_HINT if r["consumed"] else r["text"]
     rng = _Rng(S["rngState"], S["rngCalls"])
     stop = set(stop_on or [])
     highlights = []; caught = {}; caught_n = 0; new_n = 0; junk_n = 0; empty_n = 0; done = 0
@@ -500,7 +532,7 @@ def _cast_many(bait_id, times, stop_on):
     if junk_n: tail += "　🪣 杂物 %d 竿" % junk_n
     if empty_n: tail += "　🌀 空竿 %d" % empty_n
     body = ("\n———\n".join(highlights) + "\n\n") if highlights else ""
-    return "🎣 连钓 %d 竿 · 停因：%s\n%s—— 收获 ——\n%s\n%s" % (done, stop_reason, body, tail, _footer())
+    return "🎣 连钓 %d 竿 · 停因：%s\n%s—— 收获 ——\n%s" % (done, stop_reason, body, tail)
 
 _HELP = """文字钓鱼游戏（你是玩家）。用点数买鱼饵→抛竿→按稀有度概率钓鱼→卖鱼换点数→集齐图鉴。
 指令（传给 cmd()，大小写不敏感）：
@@ -517,7 +549,9 @@ _HELP = """文字钓鱼游戏（你是玩家）。用点数买鱼饵→抛竿→
   cmd('open <宝箱uid>')        打开钓上来的宝箱（需钥匙或点数）
   cmd('encyclopedia')         看图鉴收集进度
   cmd('look <id或中文名>')     细看鱼/地点/鱼饵/季节/物品（如 cmd('look 月鳞鲤')；没钓到的鱼显示 ？？？）
-抛竿偶尔会遇到漂流瓶/宝箱/宝物等惊喜事件。
+  cmd('A; B; C')              把多条指令用 ; 或换行串成一批、一次执行（最多 8 条），如 cmd('buy basic_worm 10; cast 10')、cmd('goto reed_river; cast 8 stop=new')
+抛竿偶尔会遇到漂流瓶/宝箱/宝物等惊喜事件。每次返回末尾都有一行 📊 状态栏 JSON（点数/地点/季节/回合/图鉴/余饵/未卖渔获），看它就够、不必再单独 status。
+goto 清单会标出每个钓点当季还有几种没见过的鱼（含单列的传说级），照着去补图鉴。
 目标：用有限点数把图鉴里的鱼尽量集满（有的鱼只在特定地点+季节出现）。一开始你并不知道有哪些鱼——靠抛竿去发现。"""
 
 def _drain_warn(out):
@@ -528,39 +562,53 @@ def _drain_warn(out):
         _IO_WARN = ""
     return out
 
-def cmd(line=""):
-    """游戏的唯一入口：传一条文字指令，返回结果文字。任何输入都只返回字符串、不抛异常。"""
-    _load()
+_BATCH_MAX = 8
+def _run_one(line):
+    """跑单条指令、返回结果文字（不 _load/_save、不附状态栏）。批量与单条共用；任何意外都兜成友好文字。"""
     line = (line or "").strip()
-    if not line:
-        return _drain_warn(_HELP)
+    if not line: return _HELP
     parts = line.split()
     c = parts[0].lower(); a = parts[1:]
     try:
-        if c in ("help", "h"): out = _HELP
-        elif c in ("status", "s"): out = _c_status()
-        elif c == "shop": out = _c_shop()
+        if c in ("help", "h"): return _HELP
+        elif c in ("status", "s"): return _c_status()
+        elif c == "shop": return _c_shop()
         elif c == "buy":
             if len(a) > 1 and not a[1].lstrip("+").isdigit():
-                return _drain_warn("数量得是个数字，例：buy basic_worm 2。")
-            out = _c_buy(a[0] if a else "", int(a[1]) if len(a) > 1 else 1)
+                return "数量得是个数字，例：buy basic_worm 2。"
+            return _c_buy(a[0] if a else "", int(a[1]) if len(a) > 1 else 1)
         elif c in ("cast", "c"):
             cb = next((t for t in a if t in BAITS), None)
             ct = next((int(t) for t in a if t.isdigit()), 1)
             cs = next((t[5:].split(",") for t in a if t.startswith("stop=")), None)
-            out = _cast_many(cb, ct, cs)
-        elif c == "open": out = _c_open(a[0] if a else "")
-        elif c in ("goto", "go"): out = _c_goto(a[0] if a else "")
-        elif c in ("inventory", "inv", "i"): out = _c_inv()
-        elif c == "sell": out = _c_sell(" ".join(a))
-        elif c in ("encyclopedia", "enc", "e"): out = _c_enc()
-        elif c in ("look", "l"): out = _c_look(a[0] if a else "")
-        else: return _drain_warn("未知指令「%s」。调 cmd('help') 看词表。" % c)
+            return _cast_many(cb, ct, cs)
+        elif c == "open": return _c_open(a[0] if a else "")
+        elif c in ("goto", "go"): return _c_goto(a[0] if a else "")
+        elif c in ("inventory", "inv", "i"): return _c_inv()
+        elif c == "sell": return _c_sell(" ".join(a))
+        elif c in ("encyclopedia", "enc", "e"): return _c_enc()
+        elif c in ("look", "l"): return _c_look(a[0] if a else "")
+        else: return "未知指令「%s」。调 cmd('help') 看词表。" % c
     except Exception as e:
         # 公开 API 兜底：任何意外（含格式错）都返回友好文字，绝不向调用方抛栈
-        return _drain_warn("这条指令没读懂（%s）。看 cmd('help')，例：buy basic_worm 2 / cast 10 stop=rare。" % e)
+        return "这条指令没读懂（%s）。看 cmd('help')，例：buy basic_worm 2 / cast 10 stop=rare。" % e
+
+def cmd(line=""):
+    """游戏的唯一入口：传一条文字指令，返回结果文字。任何输入都只返回字符串、不抛异常。
+    可用 ; 或换行把多条指令串成一批一次执行（省来回 token），如 cmd('buy basic_worm 10; cast 10')。"""
+    _load()
+    raw = (line or "").strip()
+    if not raw:
+        return _drain_warn(_HELP + "\n" + _state_json())
+    subs = [s.strip() for s in re.split(r"[;\n]+", raw) if s.strip()]   # 批量：; 或换行分隔
+    if len(subs) > 1:
+        run = subs[:_BATCH_MAX]
+        out = "\n\n".join("▶ %s\n%s" % (s, _run_one(s)) for s in run)
+        if len(subs) > _BATCH_MAX: out += "\n\n（一次最多 %d 条，多出的 %d 条已忽略）" % (_BATCH_MAX, len(subs) - _BATCH_MAX)
+    else:
+        out = _run_one(subs[0])
     _save()
-    return _drain_warn(out)
+    return _drain_warn(out + "\n" + _state_json())   # 末尾统一附一行 📊 状态栏 JSON
 
 def new_game(seed=_DEFAULT_SEED):
     """重开一局（可指定种子，同种子+同指令完全可复现）。"""
